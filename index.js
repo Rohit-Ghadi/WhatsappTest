@@ -32,7 +32,12 @@ app.get("/webhook", (req, res) => {
 app.post("/webhook", async (req, res) => {
   const body = req.body;
 
+  // Log every raw payload so you can see what Meta is sending
+  console.log("--- POST /webhook ---");
+  console.log(JSON.stringify(body, null, 2));
+
   if (body.object !== "whatsapp_business_account") {
+    console.warn("Unexpected object type:", body.object);
     return res.sendStatus(404);
   }
 
