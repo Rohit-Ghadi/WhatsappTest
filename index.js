@@ -1,5 +1,7 @@
 require("dotenv").config();
+const http = require("http");
 const express = require("express");
+const { WebSocketServer } = require("ws");
 const axios = require("axios");
 
 const app = express();
@@ -9,10 +11,36 @@ const {
   WHATSAPP_ACCESS_TOKEN,
   WHATSAPP_PHONE_NUMBER_ID,
   WEBHOOK_VERIFY_TOKEN,
+  RENDER_EXTERNAL_URL,
   PORT = 3000,
 } = process.env;
 
 const WHATSAPP_API_URL = `https://graph.facebook.com/v20.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
+
+// ── HTTP server (shared by Express + WebSocket) ─────────────────────────────
+const server = http.createServer(app);
+
+// ── WebSocket server ────────────────────────────────────────────────────────
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+wss.on("connection", (ws, req) => {
+  console.log(`WebSocket client connected (${wss.clients.size} total)`);
+
+  ws.send(JSON.stringify({ type: "connected", message: "Listening for WhatsApp messages..." }));
+
+  ws.on("close", () => {
+    console.log(`WebSocket client disconnected (${wss.clients.size} remaining)`);
+  });
+});
+
+function broadcast(data) {
+  const payload = JSON.stringify(data);
+  for (const client of wss.clients) {
+    if (client.readyState === client.OPEN) {
+      client.send(payload);
+    }
+  }
+}
 
 // ── Webhook verification (GET) ──────────────────────────────────────────────
 app.get("/webhook", (req, res) => {
@@ -32,12 +60,10 @@ app.get("/webhook", (req, res) => {
 app.post("/webhook", async (req, res) => {
   const body = req.body;
 
-  // Log every raw payload so you can see what Meta is sending
   console.log("--- POST /webhook ---");
   console.log(JSON.stringify(body, null, 2));
 
   if (body.object !== "whatsapp_business_account") {
-    console.warn("Unexpected object type:", body.object);
     return res.sendStatus(404);
   }
 
@@ -47,26 +73,55 @@ app.post("/webhook", async (req, res) => {
   const messages = value?.messages;
 
   if (!messages || messages.length === 0) {
-    return res.sendStatus(200); // delivery receipts / status updates
+    // Status updates / delivery receipts — broadcast those too
+    if (value?.statuses) {
+      broadcast({ type: "status", data: value.statuses[0] });
+    }
+    return res.sendStatus(200);
   }
 
   const message = messages[0];
-  const from = message.from; // sender's WhatsApp number
+  const from = message.from;
   const messageType = message.type;
+  const contact = value?.contacts?.[0];
 
   console.log(`Received ${messageType} message from ${from}`);
 
-  if (messageType === "text") {
-    const userText = message.text.body;
-    console.log(`Text: ${userText}`);
+  // Build a clean event object and broadcast to all WS clients
+  const event = {
+    type: "message",
+    from,
+    name: contact?.profile?.name ?? null,
+    messageType,
+    timestamp: message.timestamp,
+    messageId: message.id,
+    text: messageType === "text" ? message.text.body : null,
+    media: ["image", "audio", "video", "document", "sticker"].includes(messageType)
+      ? message[messageType]
+      : null,
+    location: messageType === "location" ? message.location : null,
+    raw: message,
+  };
 
-    await sendTextMessage(from, `You said: "${userText}"`);
-  } else {
-    await sendTextMessage(from, "Sorry, I can only handle text messages for now.");
+  broadcast(event);
+
+  // Echo reply for text messages
+  if (messageType === "text") {
+    await sendTextMessage(from, `You said: "${message.text.body}"`);
   }
 
   res.sendStatus(200);
 });
+
+// ── Health check ────────────────────────────────────────────────────────────
+app.get("/health", (_, res) => res.sendStatus(200));
+
+// ── Keep Render free tier alive ─────────────────────────────────────────────
+if (RENDER_EXTERNAL_URL) {
+  setInterval(() => {
+    axios.get(`${RENDER_EXTERNAL_URL}/health`).catch(() => {});
+  }, 14 * 60 * 1000);
+}
 
 // ── Helper: send a text message ─────────────────────────────────────────────
 async function sendTextMessage(to, text) {
@@ -93,7 +148,8 @@ async function sendTextMessage(to, text) {
   }
 }
 
-// ── Start server ────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`WhatsApp webhook server running on port ${PORT}`);
+// ── Start ───────────────────────────────────────────────────────────────────
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`WebSocket endpoint: ws://localhost:${PORT}/ws`);
 });
